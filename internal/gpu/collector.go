@@ -44,9 +44,9 @@ var (
 		[]string{"gpu", "name"}, nil,
 	)
 	descGPUUp = prometheus.NewDesc(
-		"thermalscope_collector_up",
-		"Whether the collector subsystem is operational (1=up, 0=down).",
-		[]string{"subsystem"}, nil,
+		"thermalscope_gpu_up",
+		"Whether the GPU collector is operational (1=up, 0=down). 0 means nvidia-smi is unavailable.",
+		nil, nil,
 	)
 )
 
@@ -71,7 +71,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	rows, err := runNvidiaSMI()
 	if err != nil {
 		slog.Warn("gpu: nvidia-smi unavailable", "err", err)
-		ch <- prometheus.MustNewConstMetric(descGPUUp, prometheus.GaugeValue, 0, "gpu")
+		ch <- prometheus.MustNewConstMetric(descGPUUp, prometheus.GaugeValue, 0)
 		return
 	}
 
@@ -102,7 +102,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	ch <- prometheus.MustNewConstMetric(descGPUUp, prometheus.GaugeValue, 1, "gpu")
+	ch <- prometheus.MustNewConstMetric(descGPUUp, prometheus.GaugeValue, 1)
 }
 
 func runNvidiaSMI() ([][]string, error) {

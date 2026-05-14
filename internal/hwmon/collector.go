@@ -1,7 +1,7 @@
 package hwmon
 
 import (
-	"fmt"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,48 +24,36 @@ var (
 		"NVMe drive temperature in Celsius.",
 		[]string{"device", "sensor"}, nil,
 	)
-	descReadErrors = prometheus.NewDesc(
-		"thermalscope_hwmon_read_errors_total",
-		"Total errors reading hwmon sensor files.",
-		[]string{"chip", "sensor"}, nil,
-	)
-	descCollectorUp = prometheus.NewDesc(
-		"thermalscope_collector_up",
-		"Whether the collector subsystem is operational (1=up, 0=down).",
-		[]string{"subsystem"}, nil,
+	descUp = prometheus.NewDesc(
+		"thermalscope_hwmon_up",
+		"Whether the hwmon collector is operational (1=up, 0=down).",
+		nil, nil,
 	)
 )
 
 // Collector reads temperature sensors from /sys/class/hwmon.
 type Collector struct {
 	hwmonRoot string
-	errors    map[string]float64
 }
 
 func NewCollector(hwmonRoot string) *Collector {
 	if hwmonRoot == "" {
 		hwmonRoot = defaultHwmonRoot
 	}
-	return &Collector{
-		hwmonRoot: hwmonRoot,
-		errors:    make(map[string]float64),
-	}
+	return &Collector{hwmonRoot: hwmonRoot}
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descCPUTemp
 	ch <- descNVMeTemp
-	ch <- descReadErrors
-	ch <- descCollectorUp
+	ch <- descUp
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	c.errors = make(map[string]float64)
-
 	entries, err := os.ReadDir(c.hwmonRoot)
 	if err != nil {
 		slog.Warn("hwmon: cannot read hwmon root", "path", c.hwmonRoot, "err", err)
-		ch <- prometheus.MustNewConstMetric(descCollectorUp, prometheus.GaugeValue, 0, "hwmon")
+		ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, 0)
 		return
 	}
 
@@ -86,14 +74,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	for key, count := range c.errors {
-		parts := strings.SplitN(key, ":", 2)
-		if len(parts) == 2 {
-			ch <- prometheus.MustNewConstMetric(descReadErrors, prometheus.CounterValue, count, parts[0], parts[1])
-		}
-	}
-
-	ch <- prometheus.MustNewConstMetric(descCollectorUp, prometheus.GaugeValue, 1, "hwmon")
+	ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, 1)
 }
 
 func (c *Collector) collectK10temp(ch chan<- prometheus.Metric, dir string) {
@@ -113,7 +94,7 @@ func (c *Collector) collectK10temp(ch chan<- prometheus.Metric, dir string) {
 		}
 		val, err := c.readMilliCelsius(dir, name)
 		if err != nil {
-			c.errors["k10temp:"+label]++
+			slog.Debug("hwmon: read failed", "chip", "k10temp", "sensor", label, "err", err)
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(descCPUTemp, prometheus.GaugeValue, val, label)
@@ -130,7 +111,7 @@ func (c *Collector) collectNVMe(ch chan<- prometheus.Metric, dir string) {
 	for base, sensorLabel := range sensorNames {
 		val, err := c.readMilliCelsius(dir, base+"_input")
 		if err != nil {
-			c.errors[fmt.Sprintf("nvme:%s:%s", device, sensorLabel)]++
+			slog.Debug("hwmon: read failed", "device", device, "sensor", sensorLabel, "err", err)
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(descNVMeTemp, prometheus.GaugeValue, val, device, sensorLabel)
@@ -157,7 +138,7 @@ func (c *Collector) resolveNVMeDevice(hwmonDir string) string {
 func (c *Collector) readMilliCelsius(dir, file string) (float64, error) {
 	raw := c.readFile(dir, file)
 	if raw == "" {
-		return 0, fmt.Errorf("empty")
+		return 0, errEmpty
 	}
 	v, err := strconv.ParseFloat(raw, 64)
 	if err != nil {
@@ -165,6 +146,8 @@ func (c *Collector) readMilliCelsius(dir, file string) (float64, error) {
 	}
 	return v / 1000.0, nil
 }
+
+var errEmpty = errors.New("empty")
 
 func (c *Collector) readFile(dir, file string) string {
 	data, err := os.ReadFile(filepath.Join(dir, file))
