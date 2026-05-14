@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -12,6 +13,9 @@ import (
 )
 
 const defaultHwmonRoot = "/sys/class/hwmon"
+
+// nvmeNameRe matches a friendly NVMe controller name like "nvme0".
+var nvmeNameRe = regexp.MustCompile(`^nvme[0-9]+$`)
 
 var (
 	descCPUTemp = prometheus.NewDesc(
@@ -118,21 +122,70 @@ func (c *Collector) collectNVMe(ch chan<- prometheus.Metric, dir string) {
 	}
 }
 
-// resolveNVMeDevice resolves the friendly nvmeN name from the hwmon symlink.
+// resolveNVMeDevice resolves the friendly nvmeN name for an NVMe hwmon directory.
+//
+// Modern kernels (verified on Linux 6.18) link hwmonN/device directly to the
+// NVMe controller at /sys/devices/.../nvme/nvmeN, so filepath.Base of the
+// resolved symlink is the friendly name. Older kernels may link to the PCI
+// parent instead, in which case nvmeN lives under <pci>/nvme/nvmeN. As a final
+// safety net we walk /sys/class/nvme/nvme*/hwmon* from the opposite direction.
 func (c *Collector) resolveNVMeDevice(hwmonDir string) string {
-	// hwmonDir/device is a symlink to the PCI device; walk up to find the nvmeN dir.
+	fallback := filepath.Base(hwmonDir)
+
 	deviceLink := filepath.Join(hwmonDir, "device")
 	target, err := filepath.EvalSymlinks(deviceLink)
+	if err == nil {
+		// Modern layout: device symlink lands directly on the controller.
+		if name := filepath.Base(target); nvmeNameRe.MatchString(name) {
+			return name
+		}
+		// Legacy layout: device symlink lands on the PCI parent; nvmeN sits
+		// in a "nvme" subdirectory.
+		if matches, _ := filepath.Glob(filepath.Join(target, "nvme", "nvme*")); len(matches) > 0 {
+			if name := filepath.Base(matches[0]); nvmeNameRe.MatchString(name) {
+				return name
+			}
+		}
+	}
+
+	// Inverse traversal: /sys/class/nvme/nvmeN/hwmonM -> match hwmonM to hwmonDir.
+	if name := c.lookupNVMeByInverseHwmon(hwmonDir); name != "" {
+		return name
+	}
+
+	return fallback
+}
+
+// lookupNVMeByInverseHwmon finds the nvmeN whose hwmon child resolves to the
+// same path as hwmonDir. It uses the sibling /sys/class/nvme directory derived
+// from the configured hwmon root so tests can substitute a fake /sys tree.
+func (c *Collector) lookupNVMeByInverseHwmon(hwmonDir string) string {
+	nvmeClass := filepath.Join(filepath.Dir(c.hwmonRoot), "nvme")
+	wantBase := filepath.Base(hwmonDir)
+	wantTarget, _ := filepath.EvalSymlinks(hwmonDir)
+
+	entries, err := os.ReadDir(nvmeClass)
 	if err != nil {
-		return filepath.Base(hwmonDir)
+		return ""
 	}
-	// The nvme block device dir lives at <pci-dev>/nvme/nvmeN
-	nvmeGlob := filepath.Join(target, "nvme", "nvme*")
-	matches, err := filepath.Glob(nvmeGlob)
-	if err != nil || len(matches) == 0 {
-		return filepath.Base(hwmonDir)
+	for _, e := range entries {
+		if !nvmeNameRe.MatchString(e.Name()) {
+			continue
+		}
+		nvmeDir := filepath.Join(nvmeClass, e.Name())
+		matches, _ := filepath.Glob(filepath.Join(nvmeDir, "hwmon*"))
+		for _, m := range matches {
+			if filepath.Base(m) == wantBase {
+				return e.Name()
+			}
+			if wantTarget != "" {
+				if t, err := filepath.EvalSymlinks(m); err == nil && t == wantTarget {
+					return e.Name()
+				}
+			}
+		}
 	}
-	return filepath.Base(matches[0])
+	return ""
 }
 
 func (c *Collector) readMilliCelsius(dir, file string) (float64, error) {
