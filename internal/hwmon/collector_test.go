@@ -47,6 +47,54 @@ func TestK10tempCollector(t *testing.T) {
 	}
 }
 
+func TestAMDGPUCollector(t *testing.T) {
+	root := t.TempDir()
+	// hwmon2 mirrors the layout observed on Talos worker nodes:
+	//   name=amdgpu, temp1_input=55000, temp1_label=edge.
+	// We add a synthetic junction sensor and an unlabeled mem sensor to
+	// cover both the labeled and fallback-to-base paths.
+	hwmon := filepath.Join(root, "hwmon2")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "amdgpu")
+	writeFile(t, hwmon, "temp1_input", "55000")
+	writeFile(t, hwmon, "temp1_label", "edge")
+	writeFile(t, hwmon, "temp2_input", "62500")
+	writeFile(t, hwmon, "temp2_label", "junction")
+	// temp3 has no label; should fall back to the "temp3" base name.
+	writeFile(t, hwmon, "temp3_input", "70000")
+	// Non-thermal sensors that must be ignored by the collector.
+	writeFile(t, hwmon, "freq1_input", "400000000")
+	writeFile(t, hwmon, "freq1_label", "sclk")
+	writeFile(t, hwmon, "power1_input", "16000000")
+	writeFile(t, hwmon, "power1_label", "PPT")
+
+	mfs := collect(t, NewCollector(root))
+
+	mf, ok := mfs["thermalscope_amdgpu_temperature_celsius"]
+	if !ok {
+		t.Fatal("metric thermalscope_amdgpu_temperature_celsius not found")
+	}
+	if got := len(mf.GetMetric()); got != 3 {
+		t.Fatalf("expected 3 amdgpu temp metrics, got %d", got)
+	}
+	seen := map[string]float64{}
+	for _, m := range mf.GetMetric() {
+		if got := labelVal(m, "chip_index"); got != "hwmon2" {
+			t.Errorf("chip_index: got %q, want %q", got, "hwmon2")
+		}
+		seen[labelVal(m, "sensor")] = m.GetGauge().GetValue()
+	}
+	if got, want := seen["edge"], 55.0; got != want {
+		t.Errorf("edge: got %v, want %v", got, want)
+	}
+	if got, want := seen["junction"], 62.5; got != want {
+		t.Errorf("junction: got %v, want %v", got, want)
+	}
+	if got, want := seen["temp3"], 70.0; got != want {
+		t.Errorf("temp3 (unlabeled fallback): got %v, want %v", got, want)
+	}
+}
+
 func TestCollectorUp(t *testing.T) {
 	root := t.TempDir()
 	hwmon := filepath.Join(root, "hwmon9")

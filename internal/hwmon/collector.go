@@ -28,6 +28,11 @@ var (
 		"NVMe drive temperature in Celsius.",
 		[]string{"device", "sensor"}, nil,
 	)
+	descAMDGPUTemp = prometheus.NewDesc(
+		"thermalscope_amdgpu_temperature_celsius",
+		"AMD GPU temperature in Celsius, read from amdgpu hwmon driver.",
+		[]string{"sensor", "chip_index"}, nil,
+	)
 	descUp = prometheus.NewDesc(
 		"thermalscope_hwmon_up",
 		"Whether the hwmon collector is operational (1=up, 0=down).",
@@ -50,6 +55,7 @@ func NewCollector(hwmonRoot string) *Collector {
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descCPUTemp
 	ch <- descNVMeTemp
+	ch <- descAMDGPUTemp
 	ch <- descUp
 }
 
@@ -75,6 +81,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			c.collectK10temp(ch, dir)
 		case "nvme":
 			c.collectNVMe(ch, dir)
+		case "amdgpu":
+			c.collectAMDGPU(ch, dir, entry.Name())
 		}
 	}
 
@@ -102,6 +110,40 @@ func (c *Collector) collectK10temp(ch chan<- prometheus.Metric, dir string) {
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(descCPUTemp, prometheus.GaugeValue, val, label)
+	}
+}
+
+// collectAMDGPU emits temperature readings from an amdgpu hwmon chip.
+//
+// The amdgpu driver exposes one or more tempN_input files, each paired with a
+// tempN_label (e.g. "edge", "junction", "mem") that is stable across reboots.
+// We include the hwmon directory basename as `chip_index` so multiple amdgpu
+// chips on the same host (multi-GPU boxes) don't collide on identical labels.
+//
+// Other amdgpu sensors (freqN, in*, power*) are intentionally out of scope for
+// this collector; thermalscope is thermal-only.
+func (c *Collector) collectAMDGPU(ch chan<- prometheus.Metric, dir, chipIndex string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Debug("hwmon: cannot read amdgpu dir", "dir", dir, "err", err)
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, "_input") || !strings.HasPrefix(name, "temp") {
+			continue
+		}
+		base := strings.TrimSuffix(name, "_input")
+		label := c.readFile(dir, base+"_label")
+		if label == "" {
+			label = base
+		}
+		val, err := c.readMilliCelsius(dir, name)
+		if err != nil {
+			slog.Debug("hwmon: read failed", "chip", "amdgpu", "sensor", label, "err", err)
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(descAMDGPUTemp, prometheus.GaugeValue, val, label, chipIndex)
 	}
 }
 
