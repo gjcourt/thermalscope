@@ -58,32 +58,24 @@ func TestCollectorUp(t *testing.T) {
 	c := NewCollector(root)
 	mfs := collect(t, c)
 
-	upMF, ok := mfs["thermalscope_collector_up"]
+	upMF, ok := mfs["thermalscope_hwmon_up"]
 	if !ok {
-		t.Fatal("thermalscope_collector_up not found")
+		t.Fatal("thermalscope_hwmon_up not found")
 	}
-	for _, m := range upMF.GetMetric() {
-		if labelVal(m, "subsystem") == "hwmon" {
-			if got := m.GetGauge().GetValue(); got != 1 {
-				t.Errorf("collector_up hwmon: got %v, want 1", got)
-			}
-		}
+	if got := upMF.GetMetric()[0].GetGauge().GetValue(); got != 1 {
+		t.Errorf("hwmon_up: got %v, want 1", got)
 	}
 }
 
 func TestUnreadableHwmonRoot(t *testing.T) {
 	c := NewCollector("/nonexistent/hwmon/path")
 	mfs := collect(t, c)
-	upMF, ok := mfs["thermalscope_collector_up"]
+	upMF, ok := mfs["thermalscope_hwmon_up"]
 	if !ok {
-		t.Fatal("thermalscope_collector_up not found when root missing")
+		t.Fatal("thermalscope_hwmon_up not found when root missing")
 	}
-	for _, m := range upMF.GetMetric() {
-		if labelVal(m, "subsystem") == "hwmon" {
-			if got := m.GetGauge().GetValue(); got != 0 {
-				t.Errorf("expected collector_up=0 for missing root, got %v", got)
-			}
-		}
+	if got := upMF.GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("expected hwmon_up=0 for missing root, got %v", got)
 	}
 }
 
