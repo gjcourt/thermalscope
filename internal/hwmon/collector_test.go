@@ -67,6 +67,138 @@ func TestCollectorUp(t *testing.T) {
 	}
 }
 
+func TestNVMeCollectorModernLayout(t *testing.T) {
+	// Modern kernels (6.x): /sys/class/hwmon/hwmonN/device -> /sys/devices/.../nvme/nvmeN
+	// i.e. the controller itself, not the PCI parent.
+	root, hwmonRoot := setupSysTree(t)
+
+	// /sys/devices/pci0000:c0/0000:c0:01.1/0000:c1:00.0/nvme/nvme0
+	pci := filepath.Join(root, "devices", "pci0000:c0", "0000:c0:01.1", "0000:c1:00.0")
+	nvmeCtrl := filepath.Join(pci, "nvme", "nvme0")
+	must(t, os.MkdirAll(nvmeCtrl, 0o755))
+
+	// hwmon0 lives under the controller and its `device` symlink points at the controller.
+	hwmon := filepath.Join(nvmeCtrl, "hwmon0")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "nvme")
+	writeFile(t, hwmon, "temp1_input", "42000")
+	writeFile(t, hwmon, "temp2_input", "44500")
+	must(t, os.Symlink(nvmeCtrl, filepath.Join(hwmon, "device")))
+
+	// /sys/class/hwmon/hwmon0 -> the controller-owned hwmon dir
+	must(t, os.Symlink(hwmon, filepath.Join(hwmonRoot, "hwmon0")))
+	// /sys/class/nvme/nvme0 -> the controller
+	must(t, os.Symlink(nvmeCtrl, filepath.Join(root, "class", "nvme", "nvme0")))
+
+	mfs := collect(t, NewCollector(hwmonRoot))
+	assertNVMeDevice(t, mfs, "nvme0", 42.0, 44.5)
+}
+
+func TestNVMeCollectorLegacyLayout(t *testing.T) {
+	// Legacy: hwmonN/device -> PCI parent; nvmeN lives at <pci>/nvme/nvmeN.
+	root, hwmonRoot := setupSysTree(t)
+
+	pci := filepath.Join(root, "devices", "pci0000:00", "0000:00:01.1", "0000:01:00.0")
+	nvmeCtrl := filepath.Join(pci, "nvme", "nvme5")
+	must(t, os.MkdirAll(nvmeCtrl, 0o755))
+
+	hwmon := filepath.Join(pci, "hwmon", "hwmon7")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "nvme")
+	writeFile(t, hwmon, "temp1_input", "38000")
+	must(t, os.Symlink(pci, filepath.Join(hwmon, "device")))
+
+	must(t, os.Symlink(hwmon, filepath.Join(hwmonRoot, "hwmon7")))
+
+	mfs := collect(t, NewCollector(hwmonRoot))
+	assertNVMeDevice(t, mfs, "nvme5", 38.0, 0)
+}
+
+func TestNVMeCollectorInverseFallback(t *testing.T) {
+	// device symlink is missing or weird; the inverse walk via /sys/class/nvme
+	// finds a sibling hwmon whose basename matches.
+	root, hwmonRoot := setupSysTree(t)
+
+	pci := filepath.Join(root, "devices", "pci0000:c0", "0000:c0:03.1", "0000:c5:00.0")
+	nvmeCtrl := filepath.Join(pci, "nvme", "nvme4")
+	must(t, os.MkdirAll(nvmeCtrl, 0o755))
+
+	// hwmon dir owned by the controller, but no `device` symlink at all.
+	hwmonCtrl := filepath.Join(nvmeCtrl, "hwmon4")
+	must(t, os.MkdirAll(hwmonCtrl, 0o755))
+	writeFile(t, hwmonCtrl, "name", "nvme")
+	writeFile(t, hwmonCtrl, "temp1_input", "55000")
+
+	must(t, os.Symlink(hwmonCtrl, filepath.Join(hwmonRoot, "hwmon4")))
+	// /sys/class/nvme/nvme4 -> controller, which contains hwmon4
+	must(t, os.Symlink(nvmeCtrl, filepath.Join(root, "class", "nvme", "nvme4")))
+
+	mfs := collect(t, NewCollector(hwmonRoot))
+	assertNVMeDevice(t, mfs, "nvme4", 55.0, 0)
+}
+
+func TestNVMeCollectorFallbackToHwmonBase(t *testing.T) {
+	// Nothing resolvable — the collector should still emit metrics labelled
+	// with the hwmon basename so we don't drop data on exotic kernels.
+	_, hwmonRoot := setupSysTree(t)
+	hwmon := filepath.Join(hwmonRoot, "hwmon2")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "nvme")
+	writeFile(t, hwmon, "temp1_input", "40000")
+
+	mfs := collect(t, NewCollector(hwmonRoot))
+	assertNVMeDevice(t, mfs, "hwmon2", 40.0, 0)
+}
+
+// setupSysTree builds a fake /sys layout under t.TempDir():
+//
+//	<root>/class/hwmon/   <- returned as hwmonRoot
+//	<root>/class/nvme/
+//	<root>/devices/...    <- callers populate as needed
+func setupSysTree(t *testing.T) (root, hwmonRoot string) {
+	t.Helper()
+	root = t.TempDir()
+	hwmonRoot = filepath.Join(root, "class", "hwmon")
+	must(t, os.MkdirAll(hwmonRoot, 0o755))
+	must(t, os.MkdirAll(filepath.Join(root, "class", "nvme"), 0o755))
+	must(t, os.MkdirAll(filepath.Join(root, "devices"), 0o755))
+	return root, hwmonRoot
+}
+
+func assertNVMeDevice(t *testing.T, mfs map[string]*dto.MetricFamily, wantDevice string, wantTemp1, wantTemp2 float64) {
+	t.Helper()
+	mf, ok := mfs["thermalscope_nvme_temperature_celsius"]
+	if !ok {
+		t.Fatal("metric thermalscope_nvme_temperature_celsius not found")
+	}
+	var sawTemp1, sawTemp2 bool
+	for _, m := range mf.GetMetric() {
+		dev := labelVal(m, "device")
+		if dev != wantDevice {
+			t.Errorf("device label: got %q, want %q", dev, wantDevice)
+			continue
+		}
+		switch labelVal(m, "sensor") {
+		case "Composite":
+			sawTemp1 = true
+			if got := m.GetGauge().GetValue(); got != wantTemp1 {
+				t.Errorf("Composite: got %v, want %v", got, wantTemp1)
+			}
+		case "Sensor1":
+			sawTemp2 = true
+			if got := m.GetGauge().GetValue(); got != wantTemp2 {
+				t.Errorf("Sensor1: got %v, want %v", got, wantTemp2)
+			}
+		}
+	}
+	if wantTemp1 != 0 && !sawTemp1 {
+		t.Errorf("missing Composite metric for %s", wantDevice)
+	}
+	if wantTemp2 != 0 && !sawTemp2 {
+		t.Errorf("missing Sensor1 metric for %s", wantDevice)
+	}
+}
+
 func TestUnreadableHwmonRoot(t *testing.T) {
 	c := NewCollector("/nonexistent/hwmon/path")
 	mfs := collect(t, c)
