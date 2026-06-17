@@ -33,6 +33,12 @@ var (
 		"AMD GPU temperature in Celsius, read from amdgpu hwmon driver.",
 		[]string{"sensor", "chip_index"}, nil,
 	)
+	descPowerWatts = prometheus.NewDesc(
+		"thermalscope_power_watts",
+		"Instantaneous power draw in watts, read from an hwmon power1_input "+
+			"sensor (microwatts in sysfs, divided by 1e6).",
+		[]string{"chip"}, nil,
+	)
 	descUp = prometheus.NewDesc(
 		"thermalscope_hwmon_up",
 		"Whether the hwmon collector is operational (1=up, 0=down).",
@@ -56,6 +62,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descCPUTemp
 	ch <- descNVMeTemp
 	ch <- descAMDGPUTemp
+	ch <- descPowerWatts
 	ch <- descUp
 }
 
@@ -84,6 +91,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		case "amdgpu":
 			c.collectAMDGPU(ch, dir, entry.Name())
 		}
+		// power1_input may appear on any chip (e.g. amdgpu PPT). It is already
+		// an instantaneous reading in microwatts, so we expose it as a gauge in
+		// watts regardless of the chip type above.
+		c.collectPowerWatts(ch, dir, chip)
 	}
 
 	ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, 1)
@@ -145,6 +156,23 @@ func (c *Collector) collectAMDGPU(ch chan<- prometheus.Metric, dir, chipIndex st
 		}
 		ch <- prometheus.MustNewConstMetric(descAMDGPUTemp, prometheus.GaugeValue, val, label, chipIndex)
 	}
+}
+
+// collectPowerWatts emits an instantaneous power reading from power1_input if
+// the chip exposes one. The sysfs value is in microwatts; we divide by 1e6 to
+// report watts. Because power1_input is already instantaneous (unlike RAPL's
+// cumulative energy_uj counter) it is a gauge, not a counter.
+func (c *Collector) collectPowerWatts(ch chan<- prometheus.Metric, dir, chip string) {
+	raw := c.readFile(dir, "power1_input")
+	if raw == "" {
+		return
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		slog.Debug("hwmon: power1_input parse failed", "chip", chip, "err", err)
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(descPowerWatts, prometheus.GaugeValue, v/1e6, chip)
 }
 
 func (c *Collector) collectNVMe(ch chan<- prometheus.Metric, dir string) {
