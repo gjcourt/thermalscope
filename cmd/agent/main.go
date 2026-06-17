@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,10 +21,29 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel(os.Getenv("THERMALSCOPE_LOG_LEVEL")),
+	})))
 	if err := run(); err != nil {
 		slog.Error("thermalscope exiting", "err", err)
 		os.Exit(1)
+	}
+}
+
+// logLevel parses THERMALSCOPE_LOG_LEVEL (debug|info|warn|error, case-insensitive)
+// into an slog.Level, defaulting to Info on empty or unrecognized values. This
+// is what surfaces the collectors' per-domain Debug diagnostics (e.g. the RAPL
+// "read energy failed" / "domain has no name file" lines) in production.
+func logLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }
 
