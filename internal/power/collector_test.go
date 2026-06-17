@@ -19,15 +19,21 @@ type raplDomain struct {
 	maxRange string // contents of `max_energy_range_uj`; "" omits the file
 }
 
-func TestRAPLCollectorMultiDomain(t *testing.T) {
-	// Mirrors the verified layout on talos-18u-ski:
-	//   intel-rapl:0   -> package-0
-	//   intel-rapl:0:0 -> core
+func TestRAPLCollectorNestedDeviceTree(t *testing.T) {
+	// Mirrors the real /sys/devices/virtual/powercap layout verified live on a
+	// Talos node, where domains are nested real directories (not flat symlinks):
+	//   intel-rapl/intel-rapl:0            -> package-0
+	//   intel-rapl/intel-rapl:0/intel-rapl:0:0 -> core
+	//   intel-rapl-mmio/intel-rapl-mmio:0  -> package-0 (a duplicate mirror that
+	//                                         must not double-count)
 	root := setupPowercap(t, []raplDomain{
-		{dir: "intel-rapl:0", name: "package-0", energy: "31986573028", maxRange: "262143328850"},
-		{dir: "intel-rapl:0:0", name: "core", energy: "27782060162", maxRange: "262143328850"},
-		// A non-RAPL sibling that must be ignored.
-		{dir: "intel-rapl-mmio:0", name: "package-0-mmio", energy: "999", maxRange: "262143328850"},
+		{dir: "intel-rapl/intel-rapl:0", name: "package-0", energy: "31986573028", maxRange: "262143328850"},
+		{dir: "intel-rapl/intel-rapl:0/intel-rapl:0:0", name: "core", energy: "27782060162", maxRange: "262143328850"},
+		// The mmio mirror exposes the SAME "package-0" name. It must be
+		// de-duplicated, not emitted as a second package-0 series.
+		{dir: "intel-rapl-mmio/intel-rapl-mmio:0", name: "package-0", energy: "999", maxRange: "262143328850"},
+		// A psys/ancillary dir with no energy_uj must be ignored entirely.
+		{dir: "intel-rapl/intel-rapl:0/enabled-dir-without-energy", name: "ignored", energy: "", maxRange: ""},
 	})
 
 	mfs := collect(t, NewCollector(root))
@@ -37,7 +43,7 @@ func TestRAPLCollectorMultiDomain(t *testing.T) {
 		t.Fatal("metric thermalscope_rapl_energy_microjoules_total not found")
 	}
 	if got := len(mf.GetMetric()); got != 2 {
-		t.Fatalf("expected 2 RAPL domains (mmio ignored), got %d", got)
+		t.Fatalf("expected 2 RAPL domains (mmio mirror de-duped, no-energy dir ignored), got %d", got)
 	}
 	seen := map[string]float64{}
 	for _, m := range mf.GetMetric() {
@@ -131,8 +137,14 @@ func setupPowercap(t *testing.T, domains []raplDomain) string {
 	for _, d := range domains {
 		dir := filepath.Join(root, d.dir)
 		must(t, os.MkdirAll(dir, 0o755))
-		writeFile(t, dir, "name", d.name)
-		writeFile(t, dir, "energy_uj", d.energy)
+		if d.name != "" {
+			writeFile(t, dir, "name", d.name)
+		}
+		// An empty energy means "this directory is not a RAPL domain": omit the
+		// energy_uj file so the walker skips it, mirroring real ancillary dirs.
+		if d.energy != "" {
+			writeFile(t, dir, "energy_uj", d.energy)
+		}
 		if d.maxRange != "" {
 			writeFile(t, dir, "max_energy_range_uj", d.maxRange)
 		}
