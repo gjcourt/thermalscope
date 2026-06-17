@@ -294,6 +294,97 @@ func assertNVMeDevice(t *testing.T, mfs map[string]*dto.MetricFamily, wantDevice
 	}
 }
 
+func TestNVMeTemperatureThresholds(t *testing.T) {
+	// Verified sysfs facts from a real Talos node's nvme hwmon chip:
+	//   temp1 has temp1_crit + temp1_max; temp2 has only temp2_max.
+	// Thresholds are millidegrees like tempN_input.
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "hwmon3")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "nvme")
+	// temp1 (Composite): current + both thresholds.
+	writeFile(t, hwmon, "temp1_input", "39850")
+	writeFile(t, hwmon, "temp1_crit", "84850")
+	writeFile(t, hwmon, "temp1_max", "81850")
+	// temp2 (Sensor1): current + max only, no crit.
+	writeFile(t, hwmon, "temp2_input", "38850")
+	writeFile(t, hwmon, "temp2_max", "65261")
+
+	mfs := collect(t, NewCollector(root))
+
+	// Current-temp series form the parity baseline.
+	tempMF, ok := mfs["thermalscope_nvme_temperature_celsius"]
+	if !ok {
+		t.Fatal("thermalscope_nvme_temperature_celsius not found")
+	}
+	type ds struct{ device, sensor string }
+	tempPairs := map[ds]bool{}
+	for _, m := range tempMF.GetMetric() {
+		tempPairs[ds{labelVal(m, "device"), labelVal(m, "sensor")}] = true
+	}
+
+	threshMF, ok := mfs["thermalscope_nvme_temperature_threshold_celsius"]
+	if !ok {
+		t.Fatal("thermalscope_nvme_temperature_threshold_celsius not found")
+	}
+
+	type key struct{ device, sensor, level string }
+	got := map[key]float64{}
+	for _, m := range threshMF.GetMetric() {
+		k := key{labelVal(m, "device"), labelVal(m, "sensor"), labelVal(m, "level")}
+		got[k] = m.GetGauge().GetValue()
+		// Label parity: every threshold's device+sensor must match a
+		// current-temp series so the PromQL headroom join lines up.
+		if !tempPairs[ds{k.device, k.sensor}] {
+			t.Errorf("threshold series %+v has no matching current-temp series", k)
+		}
+	}
+
+	dev := "hwmon3" // fallback device name (no nvme symlink in fake root).
+	want := map[key]float64{
+		{dev, "Composite", "crit"}: 84.85,
+		{dev, "Composite", "max"}:  81.85,
+		{dev, "Sensor1", "max"}:    65.261,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d threshold series, got %d: %+v", len(want), len(got), got)
+	}
+	for k, v := range want {
+		gv, ok := got[k]
+		if !ok {
+			t.Errorf("missing threshold series %+v", k)
+			continue
+		}
+		if gv != v {
+			t.Errorf("%+v: got %v, want %v", k, gv, v)
+		}
+	}
+	// Sensor1 must NOT have a crit series (no temp2_crit file present).
+	if _, ok := got[key{dev, "Sensor1", "crit"}]; ok {
+		t.Errorf("unexpected crit series for Sensor1 (no temp2_crit file)")
+	}
+}
+
+func TestNVMeNoThresholdsWhenAbsent(t *testing.T) {
+	// A sensor with a current reading but neither crit nor max emits no
+	// threshold series at all.
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "hwmon4")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "nvme")
+	writeFile(t, hwmon, "temp1_input", "40000")
+	// no temp1_crit, no temp1_max
+
+	mfs := collect(t, NewCollector(root))
+
+	if _, ok := mfs["thermalscope_nvme_temperature_celsius"]; !ok {
+		t.Fatal("expected current-temp series to be present")
+	}
+	if mf, ok := mfs["thermalscope_nvme_temperature_threshold_celsius"]; ok {
+		t.Errorf("expected no threshold series, got %d", len(mf.GetMetric()))
+	}
+}
+
 func TestUnreadableHwmonRoot(t *testing.T) {
 	c := NewCollector("/nonexistent/hwmon/path")
 	mfs := collect(t, c)

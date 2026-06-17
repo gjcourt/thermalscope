@@ -28,6 +28,14 @@ var (
 		"NVMe drive temperature in Celsius.",
 		[]string{"device", "sensor"}, nil,
 	)
+	descNVMeTempThreshold = prometheus.NewDesc(
+		"thermalscope_nvme_temperature_threshold_celsius",
+		"NVMe drive temperature threshold in Celsius. level=\"crit\" is "+
+			"tempN_crit; level=\"max\" is tempN_max. Shares device+sensor "+
+			"labels with thermalscope_nvme_temperature_celsius so headroom "+
+			"can be computed by joining the two series.",
+		[]string{"device", "sensor", "level"}, nil,
+	)
 	descAMDGPUTemp = prometheus.NewDesc(
 		"thermalscope_amdgpu_temperature_celsius",
 		"AMD GPU temperature in Celsius, read from amdgpu hwmon driver.",
@@ -61,6 +69,7 @@ func NewCollector(hwmonRoot string) *Collector {
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descCPUTemp
 	ch <- descNVMeTemp
+	ch <- descNVMeTempThreshold
 	ch <- descAMDGPUTemp
 	ch <- descPowerWatts
 	ch <- descUp
@@ -189,6 +198,30 @@ func (c *Collector) collectNVMe(ch chan<- prometheus.Metric, dir string) {
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(descNVMeTemp, prometheus.GaugeValue, val, device, sensorLabel)
+		c.collectNVMeThresholds(ch, dir, device, base, sensorLabel)
+	}
+}
+
+// collectNVMeThresholds emits temperature-threshold gauges for an NVMe sensor.
+//
+// For the same tempN that produced a thermalscope_nvme_temperature_celsius
+// series, it reads tempN_crit and tempN_max (millidegrees, like tempN_input)
+// and emits one threshold series per file that exists. The device and sensor
+// label values are passed in unchanged from collectNVMe so the threshold series
+// join cleanly to the current-temp series in PromQL. Not every sensor exposes
+// every threshold (temp1 typically has both crit+max; temp2/temp3 only max), so
+// absent files are skipped silently.
+func (c *Collector) collectNVMeThresholds(ch chan<- prometheus.Metric, dir, device, base, sensorLabel string) {
+	levels := map[string]string{
+		"crit": base + "_crit",
+		"max":  base + "_max",
+	}
+	for level, file := range levels {
+		val, err := c.readMilliCelsius(dir, file)
+		if err != nil {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(descNVMeTempThreshold, prometheus.GaugeValue, val, device, sensorLabel, level)
 	}
 }
 
