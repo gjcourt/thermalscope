@@ -16,6 +16,7 @@ import (
 
 	"github.com/gjcourt/thermalscope/internal/gpu"
 	"github.com/gjcourt/thermalscope/internal/hwmon"
+	"github.com/gjcourt/thermalscope/internal/power"
 )
 
 func main() {
@@ -32,6 +33,7 @@ func run() error {
 		listenAddr = ":9102"
 	}
 	hwmonRoot := os.Getenv("THERMALSCOPE_HWMON_ROOT")
+	powercapRoot := os.Getenv("THERMALSCOPE_POWERCAP_ROOT")
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
@@ -39,6 +41,7 @@ func run() error {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		hwmon.NewCollector(hwmonRoot),
 		gpu.NewCollector(),
+		power.NewCollector(powercapRoot),
 	)
 
 	mux := http.NewServeMux()

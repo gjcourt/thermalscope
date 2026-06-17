@@ -95,6 +95,53 @@ func TestAMDGPUCollector(t *testing.T) {
 	}
 }
 
+func TestPowerWattsFromHwmon(t *testing.T) {
+	// power1_input is reported by the kernel in microwatts; the collector must
+	// expose it as a gauge in watts (divide by 1e6), labelled by chip name.
+	// 32_000_000 uW == 32 W, matching the verified amdgpu reading on
+	// talos-18u-ski (hwmon2 power1_input = 32000000).
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "hwmon2")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "amdgpu")
+	writeFile(t, hwmon, "temp1_input", "55000")
+	writeFile(t, hwmon, "temp1_label", "edge")
+	writeFile(t, hwmon, "power1_input", "32000000")
+	writeFile(t, hwmon, "power1_label", "PPT")
+
+	mfs := collect(t, NewCollector(root))
+
+	mf, ok := mfs["thermalscope_power_watts"]
+	if !ok {
+		t.Fatal("metric thermalscope_power_watts not found")
+	}
+	if got := len(mf.GetMetric()); got != 1 {
+		t.Fatalf("expected 1 power_watts metric, got %d", got)
+	}
+	m := mf.GetMetric()[0]
+	if got, want := labelVal(m, "chip"), "amdgpu"; got != want {
+		t.Errorf("chip label: got %q, want %q", got, want)
+	}
+	if got, want := m.GetGauge().GetValue(), 32.0; got != want {
+		t.Errorf("power_watts: got %v, want %v", got, want)
+	}
+}
+
+func TestNoPowerWattsWithoutSensor(t *testing.T) {
+	// A k10temp chip has no power1_input; the power_watts family must be absent.
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "hwmon9")
+	must(t, os.MkdirAll(hwmon, 0o755))
+	writeFile(t, hwmon, "name", "k10temp")
+	writeFile(t, hwmon, "temp1_input", "50000")
+	writeFile(t, hwmon, "temp1_label", "Tctl")
+
+	mfs := collect(t, NewCollector(root))
+	if _, ok := mfs["thermalscope_power_watts"]; ok {
+		t.Error("did not expect thermalscope_power_watts when no power1_input present")
+	}
+}
+
 func TestCollectorUp(t *testing.T) {
 	root := t.TempDir()
 	hwmon := filepath.Join(root, "hwmon9")
