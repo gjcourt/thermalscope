@@ -114,12 +114,15 @@ type Collector struct {
 	// devPath. Injectable so tests can supply a fixture without a real device.
 	read func(devPath string) ([]byte, error)
 
-	// mu guards readErrors. Collect may be called concurrently by the
-	// Prometheus registry, and the collector is otherwise stateless.
+	// mu guards readErrors and failing. Collect may be called concurrently by
+	// the Prometheus registry, and the collector is otherwise stateless.
 	mu sync.Mutex
 	// readErrors accumulates the per-device count of failed log reads across
 	// scrapes, keyed by controller name (e.g. "nvme0").
 	readErrors map[string]float64
+	// failing tracks whether each device's last read failed, so we log Warn
+	// only on the transition into the failing state rather than every scrape.
+	failing map[string]bool
 }
 
 // NewCollector returns a collector using the host's real NVMe devices.
@@ -136,6 +139,7 @@ func NewCollector(sysClassNVMe, devDir string) *Collector {
 		devDir:       devDir,
 		read:         readSMARTLog,
 		readErrors:   map[string]float64{},
+		failing:      map[string]bool{},
 	}
 }
 
@@ -155,6 +159,18 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descUp
 }
 
+// deviceResult is the outcome of reading one controller this scrape: either a
+// parsed health page (failed=false) or a failed/partial read (failed=true).
+type deviceResult struct {
+	name   string
+	health smartHealth
+	failed bool
+	// readErr/shortLen describe the failure for transition logging.
+	readErr  error
+	shortLen int
+	short    bool
+}
+
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	entries, err := os.ReadDir(c.sysClassNVMe)
 	if err != nil {
@@ -163,45 +179,117 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.readErrors == nil {
-		c.readErrors = map[string]float64{}
-	}
-
+	// Phase 1: read every controller WITHOUT holding the mutex. The device
+	// read may issue a blocking ioctl, so it must never run under the lock.
+	var results []deviceResult
 	for _, entry := range entries {
 		name := entry.Name()
 		if !controllerRE.MatchString(name) {
 			continue
 		}
-		// Ensure every controller has a baseline read-error count, so a
-		// healthy device reports 0 rather than disappearing from the series.
-		if _, seen := c.readErrors[name]; !seen {
-			c.readErrors[name] = 0
-		}
 		devPath := filepath.Join(c.devDir, name)
 		raw, err := c.read(devPath)
-		if err != nil {
+		switch {
+		case err != nil:
 			// A failed admin-ioctl read (e.g. a device-cgroup EPERM denial)
-			// must be visible at the default log level and alertable, not a
-			// silent skip. Warn + increment the per-device counter.
-			slog.Warn("nvmehealth: read failed", "device", name, "err", err)
-			c.readErrors[name]++
-			continue
+			// must be visible and alertable, not a silent skip.
+			results = append(results, deviceResult{name: name, failed: true, readErr: err})
+		case len(raw) < smartLogLen:
+			// A short/partial log page is a failed read too — count it and
+			// surface it the same way rather than silently dropping it.
+			results = append(results, deviceResult{name: name, failed: true, short: true, shortLen: len(raw)})
+		default:
+			results = append(results, deviceResult{name: name, health: parseSMARTLog(raw)})
 		}
-		if len(raw) < smartLogLen {
-			slog.Debug("nvmehealth: short log page", "device", name, "len", len(raw))
-			continue
-		}
-		c.emit(ch, name, parseSMARTLog(raw))
 	}
 
-	// Emit the cumulative read-error counter for every controller seen, so a
-	// device at 0 errors still reports a baseline series.
-	for device, count := range c.readErrors {
-		ch <- prometheus.MustNewConstMetric(descReadErrors, prometheus.CounterValue, count, device)
+	// Phase 2: under the lock, update counters and the failing-state map,
+	// prune devices no longer present, and snapshot what to log/emit. We do
+	// NOT hold the lock across any channel send or device read.
+	type errSnapshot struct {
+		name  string
+		count float64
+	}
+	var (
+		errSnaps     []errSnapshot
+		warnOnFailed []deviceResult // devices that just transitioned into failing
+		recovered    []string       // devices that just transitioned out of failing
+	)
+
+	c.mu.Lock()
+	if c.readErrors == nil {
+		c.readErrors = map[string]float64{}
+	}
+	if c.failing == nil {
+		c.failing = map[string]bool{}
 	}
 
+	present := make(map[string]struct{}, len(results))
+	for _, r := range results {
+		present[r.name] = struct{}{}
+		if r.failed {
+			c.readErrors[r.name]++
+			if !c.failing[r.name] {
+				c.failing[r.name] = true
+				warnOnFailed = append(warnOnFailed, r)
+			}
+		} else {
+			// Ensure a baseline so a healthy device reports 0 rather than
+			// dropping out of the series.
+			if _, seen := c.readErrors[r.name]; !seen {
+				c.readErrors[r.name] = 0
+			}
+			if c.failing[r.name] {
+				c.failing[r.name] = false
+				recovered = append(recovered, r.name)
+			}
+		}
+	}
+
+	// Prune devices that disappeared this scrape so we stop emitting a frozen
+	// series and the maps don't grow without bound.
+	for device := range c.readErrors {
+		if _, ok := present[device]; !ok {
+			delete(c.readErrors, device)
+			delete(c.failing, device)
+		}
+	}
+	// failing can hold a device absent from readErrors only transiently; prune
+	// any stragglers so the maps stay bounded together.
+	for device := range c.failing {
+		if _, ok := present[device]; !ok {
+			delete(c.failing, device)
+		}
+	}
+
+	// Snapshot the counts for currently-present devices to emit after unlock.
+	for device := range present {
+		errSnaps = append(errSnaps, errSnapshot{name: device, count: c.readErrors[device]})
+	}
+	c.mu.Unlock()
+
+	// Log transitions outside the lock. Warn only on entry into the failing
+	// state; a single Info on recovery.
+	for _, r := range warnOnFailed {
+		if r.short {
+			slog.Warn("nvmehealth: short log page", "device", r.name, "len", r.shortLen)
+		} else {
+			slog.Warn("nvmehealth: read failed", "device", r.name, "err", r.readErr)
+		}
+	}
+	for _, device := range recovered {
+		slog.Info("nvmehealth: read recovered", "device", device)
+	}
+
+	// Phase 3: emit all metrics WITHOUT holding the lock.
+	for _, r := range results {
+		if !r.failed {
+			c.emit(ch, r.name, r.health)
+		}
+	}
+	for _, s := range errSnaps {
+		ch <- prometheus.MustNewConstMetric(descReadErrors, prometheus.CounterValue, s.count, s.name)
+	}
 	ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, 1)
 }
 

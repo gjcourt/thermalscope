@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -170,15 +171,116 @@ func TestCollect_ReadErrorCounterAccumulates(t *testing.T) {
 	}
 
 	second := gather(t, c)
-	if second["thermalscope_nvme_read_errors_total/nvme1"] <= first["thermalscope_nvme_read_errors_total/nvme1"] {
-		t.Errorf("nvme1 read_errors_total did not increment across scrapes: first=%v second=%v",
-			first["thermalscope_nvme_read_errors_total/nvme1"],
-			second["thermalscope_nvme_read_errors_total/nvme1"])
+	// Exactly +1 per scrape — proves the counter is not double-counted within
+	// a single Collect (e.g. by emitting per-device and per-map).
+	if got, want := second["thermalscope_nvme_read_errors_total/nvme1"],
+		first["thermalscope_nvme_read_errors_total/nvme1"]+1; got != want {
+		t.Errorf("nvme1 read_errors_total = %v on second scrape, want exactly first+1 (%v)", got, want)
 	}
 	if second["thermalscope_nvme_read_errors_total/nvme0"] != 0 {
 		t.Errorf("healthy nvme0 read_errors_total = %v on second scrape, want 0",
 			second["thermalscope_nvme_read_errors_total/nvme0"])
 	}
+}
+
+func TestCollect_DeviceDisappearsPrunesSeries(t *testing.T) {
+	// Scrape 1: nvme0 healthy, nvme1 present and failing. Scrape 2: nvme1 has
+	// disappeared from /sys/class/nvme. Its read_errors_total series must no
+	// longer be emitted and its map entry must be pruned (no frozen series, no
+	// unbounded growth).
+	sysClass := t.TempDir()
+	for _, name := range []string{"nvme0", "nvme1"} {
+		if err := os.Mkdir(filepath.Join(sysClass, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+	read := func(dev string) ([]byte, error) {
+		if filepath.Base(dev) == "nvme1" {
+			return nil, errors.New("operation not permitted")
+		}
+		return makeSMARTLog(0, 100, 10, 1, 0, 0, 0), nil
+	}
+	c := &Collector{sysClassNVMe: sysClass, devDir: "/dev", read: read}
+
+	first := gather(t, c)
+	if first["thermalscope_nvme_read_errors_total/nvme1"] != 1 {
+		t.Fatalf("nvme1 read_errors_total = %v on scrape 1, want 1",
+			first["thermalscope_nvme_read_errors_total/nvme1"])
+	}
+
+	// nvme1 disappears.
+	if err := os.Remove(filepath.Join(sysClass, "nvme1")); err != nil {
+		t.Fatalf("remove nvme1: %v", err)
+	}
+
+	second := gather(t, c)
+	if _, ok := second["thermalscope_nvme_read_errors_total/nvme1"]; ok {
+		t.Errorf("nvme1 read_errors_total still emitted after device disappeared: %v",
+			second["thermalscope_nvme_read_errors_total/nvme1"])
+	}
+	if second["thermalscope_nvme_read_errors_total/nvme0"] != 0 {
+		t.Errorf("nvme0 read_errors_total = %v after nvme1 disappeared, want 0",
+			second["thermalscope_nvme_read_errors_total/nvme0"])
+	}
+
+	// The internal map must not retain the stale device.
+	c.mu.Lock()
+	if _, ok := c.readErrors["nvme1"]; ok {
+		c.mu.Unlock()
+		t.Error("readErrors map still retains nvme1 after it disappeared")
+	} else {
+		c.mu.Unlock()
+	}
+}
+
+func TestCollect_ShortLogPageCountsAsReadError(t *testing.T) {
+	// A short/partial log page is treated as a failed read: it must increment
+	// read_errors_total and not emit health metrics.
+	read := func(string) ([]byte, error) { return make([]byte, smartLogLen-1), nil }
+	c := newTestCollector(t, []string{"nvme0"}, read)
+
+	got := gather(t, c)
+	if got["thermalscope_nvme_read_errors_total/nvme0"] != 1 {
+		t.Errorf("short-page read_errors_total = %v, want 1",
+			got["thermalscope_nvme_read_errors_total/nvme0"])
+	}
+	if _, ok := got["thermalscope_nvme_percentage_used_ratio/nvme0"]; ok {
+		t.Error("health metrics should be absent for a short log page")
+	}
+	if got["thermalscope_nvmehealth_up"] != 1 {
+		t.Errorf("up = %v, want 1 on a short-page read", got["thermalscope_nvmehealth_up"])
+	}
+}
+
+func TestCollect_ConcurrentCollect(t *testing.T) {
+	// Regression guard for the concurrency risk: many goroutines calling
+	// Collect at once must not race on the shared maps. Run under -race.
+	read := func(dev string) ([]byte, error) {
+		if filepath.Base(dev) == "nvme1" {
+			return nil, errors.New("operation not permitted")
+		}
+		return makeSMARTLog(0, 100, 10, 1, 0, 0, 0), nil
+	}
+	c := newTestCollector(t, []string{"nvme0", "nvme1"}, read)
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				ch := make(chan prometheus.Metric, 64)
+				go func() {
+					for range ch {
+					}
+				}()
+				c.Collect(ch)
+				close(ch)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestCollect_DownWhenSysClassMissing(t *testing.T) {
