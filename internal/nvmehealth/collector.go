@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -93,6 +94,11 @@ var (
 		"NVMe data units read over the drive's lifetime (1 unit = 1000 * 512 bytes per the NVMe spec).",
 		[]string{"device"}, nil,
 	)
+	descReadErrors = prometheus.NewDesc(
+		"thermalscope_nvme_read_errors_total",
+		"Cumulative count of failed NVMe SMART/Health log reads per controller.",
+		[]string{"device"}, nil,
+	)
 	descUp = prometheus.NewDesc(
 		"thermalscope_nvmehealth_up",
 		"Whether the NVMe health collector is operational (1=up, 0=down).",
@@ -107,6 +113,13 @@ type Collector struct {
 	// read returns the raw SMART/Health log page for the controller device at
 	// devPath. Injectable so tests can supply a fixture without a real device.
 	read func(devPath string) ([]byte, error)
+
+	// mu guards readErrors. Collect may be called concurrently by the
+	// Prometheus registry, and the collector is otherwise stateless.
+	mu sync.Mutex
+	// readErrors accumulates the per-device count of failed log reads across
+	// scrapes, keyed by controller name (e.g. "nvme0").
+	readErrors map[string]float64
 }
 
 // NewCollector returns a collector using the host's real NVMe devices.
@@ -118,7 +131,12 @@ func NewCollector(sysClassNVMe, devDir string) *Collector {
 	if devDir == "" {
 		devDir = defaultDevDir
 	}
-	return &Collector{sysClassNVMe: sysClassNVMe, devDir: devDir, read: readSMARTLog}
+	return &Collector{
+		sysClassNVMe: sysClassNVMe,
+		devDir:       devDir,
+		read:         readSMARTLog,
+		readErrors:   map[string]float64{},
+	}
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -133,6 +151,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descUnsafeShutdowns
 	ch <- descDataUnitsWritten
 	ch <- descDataUnitsRead
+	ch <- descReadErrors
 	ch <- descUp
 }
 
@@ -144,15 +163,30 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.readErrors == nil {
+		c.readErrors = map[string]float64{}
+	}
+
 	for _, entry := range entries {
 		name := entry.Name()
 		if !controllerRE.MatchString(name) {
 			continue
 		}
+		// Ensure every controller has a baseline read-error count, so a
+		// healthy device reports 0 rather than disappearing from the series.
+		if _, seen := c.readErrors[name]; !seen {
+			c.readErrors[name] = 0
+		}
 		devPath := filepath.Join(c.devDir, name)
 		raw, err := c.read(devPath)
 		if err != nil {
-			slog.Debug("nvmehealth: read failed", "device", name, "err", err)
+			// A failed admin-ioctl read (e.g. a device-cgroup EPERM denial)
+			// must be visible at the default log level and alertable, not a
+			// silent skip. Warn + increment the per-device counter.
+			slog.Warn("nvmehealth: read failed", "device", name, "err", err)
+			c.readErrors[name]++
 			continue
 		}
 		if len(raw) < smartLogLen {
@@ -160,6 +194,12 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 		c.emit(ch, name, parseSMARTLog(raw))
+	}
+
+	// Emit the cumulative read-error counter for every controller seen, so a
+	// device at 0 errors still reports a baseline series.
+	for device, count := range c.readErrors {
+		ch <- prometheus.MustNewConstMetric(descReadErrors, prometheus.CounterValue, count, device)
 	}
 
 	ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, 1)

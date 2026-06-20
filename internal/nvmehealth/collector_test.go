@@ -145,6 +145,42 @@ func TestCollect_SkipsNamespacesAndFailedReads(t *testing.T) {
 	}
 }
 
+func TestCollect_ReadErrorCounterAccumulates(t *testing.T) {
+	// nvme0 reads cleanly; nvme1's read always fails. The per-device read-error
+	// counter must increment for nvme1 on each scrape, report a 0 baseline for
+	// the healthy nvme0, and the collector must stay up.
+	read := func(dev string) ([]byte, error) {
+		if filepath.Base(dev) == "nvme1" {
+			return nil, errors.New("operation not permitted")
+		}
+		return makeSMARTLog(0, 100, 10, 1, 0, 0, 0), nil
+	}
+	c := newTestCollector(t, []string{"nvme0", "nvme1"}, read)
+
+	first := gather(t, c)
+	if first["thermalscope_nvme_read_errors_total/nvme1"] < 1 {
+		t.Errorf("nvme1 read_errors_total = %v, want >=1 after a failed read",
+			first["thermalscope_nvme_read_errors_total/nvme1"])
+	}
+	if v, ok := first["thermalscope_nvme_read_errors_total/nvme0"]; !ok || v != 0 {
+		t.Errorf("healthy nvme0 read_errors_total = %v (present=%v), want 0", v, ok)
+	}
+	if first["thermalscope_nvmehealth_up"] != 1 {
+		t.Errorf("up = %v, want 1 even when a device read fails", first["thermalscope_nvmehealth_up"])
+	}
+
+	second := gather(t, c)
+	if second["thermalscope_nvme_read_errors_total/nvme1"] <= first["thermalscope_nvme_read_errors_total/nvme1"] {
+		t.Errorf("nvme1 read_errors_total did not increment across scrapes: first=%v second=%v",
+			first["thermalscope_nvme_read_errors_total/nvme1"],
+			second["thermalscope_nvme_read_errors_total/nvme1"])
+	}
+	if second["thermalscope_nvme_read_errors_total/nvme0"] != 0 {
+		t.Errorf("healthy nvme0 read_errors_total = %v on second scrape, want 0",
+			second["thermalscope_nvme_read_errors_total/nvme0"])
+	}
+}
+
 func TestCollect_DownWhenSysClassMissing(t *testing.T) {
 	c := &Collector{sysClassNVMe: "/nonexistent/nvme", devDir: "/dev",
 		read: func(string) ([]byte, error) { return nil, nil }}
