@@ -17,6 +17,7 @@ import (
 
 	"github.com/gjcourt/thermalscope/internal/gpu"
 	"github.com/gjcourt/thermalscope/internal/hwmon"
+	"github.com/gjcourt/thermalscope/internal/nvmehealth"
 	"github.com/gjcourt/thermalscope/internal/power"
 )
 
@@ -47,6 +48,17 @@ func logLevel(s string) slog.Level {
 	}
 }
 
+// enabled reports whether an env var is set to a truthy value (1/true/yes,
+// case-insensitive).
+func enabled(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func run() error {
 	listenAddr := os.Getenv("THERMALSCOPE_LISTEN_ADDR")
 	if listenAddr == "" {
@@ -63,6 +75,18 @@ func run() error {
 		gpu.NewCollector(),
 		power.NewCollector(powercapRoot),
 	)
+
+	// NVMe SMART/Health (wear & failure-prediction) is opt-in: reading the
+	// SMART log requires CAP_SYS_ADMIN + /dev/nvme* access, so it runs only in
+	// the dedicated privileged DaemonSet that sets THERMALSCOPE_NVME_HEALTH=1.
+	// The default (unprivileged, sysfs-only) agent leaves it off.
+	if enabled(os.Getenv("THERMALSCOPE_NVME_HEALTH")) {
+		slog.Info("nvme health collector enabled")
+		reg.MustRegister(nvmehealth.NewCollector(
+			os.Getenv("THERMALSCOPE_NVME_SYSCLASS_ROOT"),
+			os.Getenv("THERMALSCOPE_NVME_DEV_ROOT"),
+		))
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
