@@ -13,6 +13,9 @@ Prometheus metrics on `:9102`. Collectors:
 Config is via env: `THERMALSCOPE_HWMON_ROOT` (override the hwmon sysfs root),
 `THERMALSCOPE_LOG_LEVEL` (`debug|info|warn|error`), and the NVMe-health opt-in.
 
+For a full component/data-flow walkthrough (collectors, runtime flow, sysfs
+paths, design decisions, and deploy topology), see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Layout
 
 - `cmd/agent/` — entry point (`main.go`); registers collectors and serves `/metrics`.
