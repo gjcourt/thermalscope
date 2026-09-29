@@ -111,7 +111,7 @@ make build   # docker buildx build --platform=linux/amd64 --load -t ghcr.io/gjco
 The image is a two-stage build: a `golang:1.23-bookworm` builder produces a
 static (`CGO_ENABLED=0`, `linux/amd64`) binary, copied into
 `gcr.io/distroless/static-debian12`. It listens on `9102` and runs as
-`USER 0:0` (root is required to read most of the sensors below, but the image
+`USER 0:0` (root is required to read most of the sensors above, but the image
 carries no shell or package manager).
 
 To enable the NVMe health collector, run the same image with
