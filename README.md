@@ -1,7 +1,7 @@
 <!-- readme-type: exporter -->
 # thermalscope
 
-Prometheus thermal metrics exporter for hestia — CPU, NVMe, and GPU temps via hwmon + nvidia-smi
+Prometheus exporter for per-node CPU, NVMe, and GPU temperatures and RAPL power, from sysfs and nvidia-smi
 
 Per-node CPU, GPU, NVMe, and RAPL power sensors live in scattered sysfs paths
 and vendor tools, with no single view of a node's thermal and power state.
@@ -13,7 +13,7 @@ independently: a missing sensor tree or absent `nvidia-smi` turns into a
 process.
 
 **Status:** in daily use on the homelab since 2026-05, deployed as two
-DaemonSets (`thermalscope`, `thermalscope-smart`) in
+DaemonSets (`thermalscope-agent`, `thermalscope-smart-agent`) in
 [`apps/production/thermalscope`](https://github.com/gjcourt/homelab/tree/master/apps/production/thermalscope)
 in `gjcourt/homelab`, currently pinned to `2026-07-26-eeaceb6`.
 
