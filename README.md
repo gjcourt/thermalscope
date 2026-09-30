@@ -172,4 +172,4 @@ Bump the pins there — never repoint `latest`.
 
 ## License
 
-No licence file yet.
+Apache License 2.0 — see [LICENSE](LICENSE).
